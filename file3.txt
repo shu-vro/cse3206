@@ -1,1 +1,5 @@
+<<<<<<< HEAD
 clear
+=======
+set to go
+>>>>>>> Shahriar-Hasan
