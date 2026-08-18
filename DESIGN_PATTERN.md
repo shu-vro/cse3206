@@ -1,156 +1,187 @@
 # Design Patterns in This Project
 
-Two behavioural patterns fit this codebase naturally: **State** (for the audio player)
-and **Strategy** (for how the transcript highlights, and for how audio gets
-synthesized). Both are illustrated against the classes that already exist in
-`public/app.js` and `server.js`.
+Three patterns are **implemented** in `public/app.js`: **Strategy** (how the
+transcript highlights), **State** (what the player does at each point of its
+lifecycle) and **Facade** (`ReaderFacade`, the single door in front of the three
+collaborators). This document explains each pattern, points at the exact code,
+and shows the UML.
 
-Current classes:
+## Class map
 
-| Class | File | Responsibility |
+| Class | Lines in `public/app.js` | Role |
 | --- | --- | --- |
-| `TTSClient` | `public/app.js` | Calls `POST /api/tts`, returns `{audio, words}` |
-| `Transcript` | `public/app.js` | Renders word spans, maps a time to a word, highlights |
-| `Player` | `public/app.js` | Wraps `<audio>`, play/pause/seek, per-frame tick |
-| `App` | `public/app.js` | Wires DOM to the three collaborators above |
+| `HighlightStrategy` | 8 | Strategy interface |
+| `WordHighlight`, `KaraokeHighlight`, `SentenceHighlight` | 16, 24, 31 | Concrete strategies |
+| `PlayerState` | 62 | State interface |
+| `IdleState`, `PausedState`, `PlayingState`, `EndedState` | 81, 89, 100, 110 | Concrete states |
+| `TTSClient` | 122 | Calls `POST /api/tts` |
+| `Transcript` | 141 | Renders spans, maps a time to a word, repaints |
+| `Player` | 202 | Wraps `<audio>`, delegates to its state |
+| `ReaderFacade` | 258 | Facade over client + transcript + player |
+| `App` | 292 | DOM wiring only |
 
 ---
 
-## 1. State Pattern — the `Player`
+## 1. Strategy Pattern — how words get highlighted
 
-### Intent
+### What the pattern is
 
-Let an object change its behaviour when its internal state changes. The object
-appears to change class. Each state is its own class that knows what the
-operations mean *while in that state*, and which state comes next.
+Define a family of interchangeable algorithms behind a single interface, so the
+algorithm can be chosen — and swapped — at runtime without the object that uses
+it changing at all. The user of the algorithm ("the context") knows only the
+interface; each concrete strategy is independent of the others.
 
-### The problem in the current code
+### Where it applies here
 
-The player's state machine is real, but it is scattered and implicit:
+Deciding which words look "current" and which look "already spoken" is a
+*policy*, not a mechanism. Three sensible policies exist, and a user might want
+a different one mid-playback, so the decision is pulled out of `Transcript` into
+its own object.
 
-- `Player.toggle()` (`public/app.js:86`) branches on `audio.paused`.
-- `App.#syncButton()` (`public/app.js:152`) re-derives the label from `isPlaying`.
-- `App.generate()` sets `playPauseEl.disabled = false` after loading audio.
-- Nothing models "ended" — after playback finishes, pressing Play restarts only
-  because the browser happens to rewind.
-
-One state machine, encoded in four places. Adding a "loading" or "ended"
-behaviour means editing all four.
-
-### States
-
-| State | Meaning | Button label | Button enabled |
-| --- | --- | --- | --- |
-| `IdleState` | No audio generated yet | `Play` | no |
-| `PausedState` | Audio loaded, stopped | `Play` | yes |
-| `PlayingState` | Audio running | `Pause` | yes |
-| `EndedState` | Reached the end | `Play` | yes (restarts) |
-
-### Implementation
+`Transcript` is the context. It holds one `HighlightStrategy` and asks it, per
+word, which CSS class to apply (`repaint()`, line 188):
 
 ```js
-class PlayerState {
-    constructor(player) {
-        this.player = player;
-    }
-    get label() {
-        return "Play";
-    }
-    get enabled() {
-        return true;
-    }
-    toggle() {}
-    seek(seconds) {
-        this.player.audio.currentTime = seconds;
-    }
-}
-
-class IdleState extends PlayerState {
-    get enabled() {
-        return false;
-    }
-    seek() {} // clicking a word does nothing before audio exists
-}
-
-class PausedState extends PlayerState {
-    toggle() {
-        this.player.audio.play(); // transitions to PlayingState
-    }
-    seek(seconds) {
-        super.seek(seconds);
-        this.player.audio.play(); // clicking a word starts playback
-    }
-}
-
-class PlayingState extends PlayerState {
-    get label() {
-        return "Pause";
-    }
-    toggle() {
-        this.player.audio.pause(); // transitions to PausedState
-    }
-}
-
-class EndedState extends PausedState {
-    toggle() {
-        this.player.audio.currentTime = 0;
-        this.player.audio.play();
-    }
+repaint(index) {
+    this.spans.forEach((span, i) => {
+        const cls = this.strategy.classFor(i, index, this.words);
+        span.classList.toggle("active", cls === "active");
+        span.classList.toggle("spoken", cls === "spoken");
+    });
 }
 ```
 
-`Player` becomes a thin context object. It holds the current state and delegates
-to it; the DOM audio events drive the transitions:
+The three implementations:
+
+| Strategy | Behaviour |
+| --- | --- |
+| `WordHighlight` (default) | Current word `active`, all earlier words `spoken` |
+| `KaraokeHighlight` | Only the current word `active`, no trail behind it |
+| `SentenceHighlight` | The whole current sentence `active`, earlier sentences `spoken` |
+
+`SentenceHighlight` has to find sentence boundaries without punctuation, because
+the Edge TTS `WordBoundary` events report bare words. It infers a break from the
+silence between two words (`GAP = 0.25` seconds) — the same silence a listener
+hears as a full stop.
+
+Swapping is one call, `ReaderFacade.setHighlight()` (line 283), wired to the
+`#highlight` `<select>` in `public/index.html`:
 
 ```js
-class Player {
-    constructor(onTick, onStateChange) {
-        this.audio = new Audio();
-        this.onTick = onTick;
-        this.onStateChange = onStateChange;
-        this.frame = null;
-        this.setState(new IdleState(this));
-
-        this.audio.addEventListener("play", () => {
-            this.setState(new PlayingState(this));
-            this.#loop();
-        });
-        this.audio.addEventListener("pause", () => this.setState(new PausedState(this)));
-        this.audio.addEventListener("ended", () => this.setState(new EndedState(this)));
-    }
-
-    setState(state) {
-        this.state = state;
-        this.onStateChange(state);
-    }
-
-    load(base64Mp3) {
-        this.audio.src = "data:audio/mpeg;base64," + base64Mp3;
-        this.setState(new PausedState(this));
-    }
-
-    toggle() {
-        this.state.toggle();
-    }
-
-    seek(seconds) {
-        this.state.seek(seconds);
-        this.onTick(seconds);
-    }
+setHighlight(name) {
+    this.transcript.setStrategy(HIGHLIGHTS[name]());
 }
 ```
 
-`App` stops deriving anything. It reacts to a state change:
+`setStrategy()` (line 151) immediately repaints with the new policy, so the
+change is visible mid-sentence. Nothing else in the codebase changes when a
+fourth strategy is added: write the class, add one line to the `HIGHLIGHTS` map
+(line 52) and one `<option>`.
+
+### UML
+
+```mermaid
+classDiagram
+    class Transcript {
+        -HighlightStrategy strategy
+        -Array words
+        -Array spans
+        -int activeIndex
+        +render(words)
+        +indexAt(time) int
+        +highlightAt(time)
+        +repaint(index)
+        +setStrategy(strategy)
+        +startTime(index) float
+    }
+    class HighlightStrategy {
+        <<interface>>
+        +classFor(index, activeIndex, words) string
+    }
+    class WordHighlight {
+        +classFor(index, activeIndex) string
+    }
+    class KaraokeHighlight {
+        +classFor(index, activeIndex) string
+    }
+    class SentenceHighlight {
+        +GAP: float$
+        +classFor(index, activeIndex, words) string
+    }
+
+    Transcript o--> HighlightStrategy : strategy
+    HighlightStrategy <|-- WordHighlight
+    HighlightStrategy <|-- KaraokeHighlight
+    HighlightStrategy <|-- SentenceHighlight
+```
+
+---
+
+## 2. State Pattern — what the player can do right now
+
+### What the pattern is
+
+Let an object alter its behaviour when its internal state changes; the object
+appears to change class. Each state becomes a class holding the behaviour valid
+*in that state*, and the states drive the transitions between one another. It
+replaces conditionals that test a status flag in many places.
+
+### Where it applies here
+
+The player has a real lifecycle: nothing loaded, loaded but stopped, running,
+finished. Before this refactor the lifecycle was implicit and duplicated —
+`toggle()` branched on `audio.paused`, the button label was re-derived
+separately, and `disabled` was flipped by hand after generation. There was no
+"ended" concept at all, so the button still said "Pause" after playback ran out.
+
+Now `Player` is a thin context (line 202). It stores the current state and
+delegates:
 
 ```js
-onStateChange(state) {
+toggle() {
+    this.state.toggle();
+}
+
+seek(seconds) {
+    this.state.seek(seconds);
+    this.onTick(seconds);
+}
+```
+
+The four states:
+
+| State | Meaning | `label` | `enabled` | `toggle()` | `seek()` |
+| --- | --- | --- | --- | --- | --- |
+| `IdleState` | Nothing generated yet | `Play` | `false` | nothing | ignored |
+| `PausedState` | Loaded, stopped | `Play` | `true` | `audio.play()` | seek **and** play |
+| `PlayingState` | Running | `Pause` | `true` | `audio.pause()` | seek, keep playing |
+| `EndedState` | Finished | `Play` | `true` | rewind to 0, play | seek **and** play |
+
+`EndedState extends PausedState`, because "finished" behaves like "stopped"
+except that pressing play starts over rather than resuming at the end.
+
+Transitions are driven by the real `<audio>` events, so the state can never
+disagree with the element (line 208-221):
+
+```js
+this.audio.addEventListener("play",  () => { this.setState(new PlayingState(this)); this.#loop(); });
+this.audio.addEventListener("pause", () => { this.setState(new PausedState(this)); … });
+this.audio.addEventListener("ended", () => { this.setState(new EndedState(this)); … });
+```
+
+Every state change is published through `onStateChange`, and the UI simply
+mirrors it (`App`, line 305):
+
+```js
+onPlayerState: (state) => {
     this.playPauseEl.textContent = state.label;
     this.playPauseEl.disabled = !state.enabled;
-}
+},
 ```
 
-The `playPauseEl.disabled = false` line inside `generate()` disappears —
-`Player.load()` now owns that transition.
+The button label and the disabled flag now have exactly one source of truth. The
+old `#syncButton()` helper and the manual `playPauseEl.disabled = false` line in
+`generate()` are gone.
 
 ### UML — class diagram
 
@@ -159,10 +190,13 @@ classDiagram
     class Player {
         -HTMLAudioElement audio
         -PlayerState state
+        -Function onTick
+        -Function onStateChange
         +setState(state)
         +load(base64Mp3)
         +toggle()
         +seek(seconds)
+        -loop()
     }
     class PlayerState {
         <<abstract>>
@@ -172,10 +206,21 @@ classDiagram
         +toggle()
         +seek(seconds)
     }
-    class IdleState
-    class PausedState
-    class PlayingState
-    class EndedState
+    class IdleState {
+        +enabled: boolean
+        +seek(seconds)
+    }
+    class PausedState {
+        +toggle()
+        +seek(seconds)
+    }
+    class PlayingState {
+        +label: string
+        +toggle()
+    }
+    class EndedState {
+        +toggle()
+    }
 
     Player o--> PlayerState : current state
     PlayerState <|-- IdleState
@@ -184,7 +229,7 @@ classDiagram
     PausedState <|-- EndedState
 ```
 
-### UML — state diagram
+### UML — state machine
 
 ```mermaid
 stateDiagram-v2
@@ -193,216 +238,163 @@ stateDiagram-v2
     Paused --> Playing : toggle() / seek(word)
     Playing --> Paused : toggle()
     Playing --> Ended : audio ended
-    Ended --> Playing : toggle() (rewind + play)
-    Ended --> Playing : seek(word)
+    Ended --> Playing : toggle() (rewind) / seek(word)
+    Paused --> Paused : load(new audio)
 ```
 
 ---
 
-## 2. Strategy Pattern
+## 3. Facade Pattern — `ReaderFacade`
 
-### Intent
+### What the pattern is
 
-Define a family of interchangeable algorithms behind one interface, so the
-algorithm can be selected (and swapped) at runtime without the caller changing.
+Provide one simplified interface to a set of collaborating objects. The facade
+does not add behaviour or hide the subsystem from anyone who needs it; it gives
+the ordinary caller a small, task-shaped door instead of a wall of objects and
+an ordering the caller must get right.
 
-### 2a. `HighlightStrategy` — how the transcript marks words
+### Where it applies here
 
-Today `Transcript.highlightAt()` (`public/app.js:55-63`) hardcodes one rule:
-the current word gets `active`, every earlier word gets `spoken`. That is a
-policy, not a mechanism — a perfect Strategy candidate.
+Reading text aloud takes four coordinated steps across three objects: call
+`TTSClient.synthesize()`, feed the words to `Transcript.render()`, feed the
+audio to `Player.load()`, and connect the player's per-frame tick back into
+`Transcript.highlightAt()`. Get the order wrong and the highlight desynchronises.
+Previously `App` did all of this itself, so the DOM layer knew the whole
+subsystem.
+
+`ReaderFacade` (line 258) owns the wiring, including the two callbacks that
+close the loop between player and transcript:
 
 ```js
-class HighlightStrategy {
-    /** @returns {"active"|"spoken"|null} the CSS class for word i */
-    classFor(index, activeIndex, words) {
-        return null;
+class ReaderFacade {
+    constructor(container, { onStatus, onPlayerState }) {
+        this.onStatus = onStatus;
+        this.client = new TTSClient();
+        this.transcript = new Transcript(container, (i) => this.jumpToWord(i));
+        this.player = new Player((time) => this.transcript.highlightAt(time), onPlayerState);
     }
-}
 
-class WordHighlight extends HighlightStrategy {
-    classFor(index, activeIndex) {
-        if (index === activeIndex) return "active";
-        return index < activeIndex ? "spoken" : null;
-    }
-}
-
-class KaraokeHighlight extends HighlightStrategy {
-    // Only the current word is marked; no grey trail behind it.
-    classFor(index, activeIndex) {
-        return index === activeIndex ? "active" : null;
-    }
-}
-
-class SentenceHighlight extends HighlightStrategy {
-    // Highlights the whole sentence containing the current word.
-    classFor(index, activeIndex, words) {
-        if (activeIndex < 0) return null;
-        const [from, to] = index < activeIndex ? [index, activeIndex] : [activeIndex, index];
-        const sentenceBreak = words
-            .slice(from, to)
-            .some((word) => /[.!?]$/.test(word.text));
-        if (!sentenceBreak) return "active";
-        return index < activeIndex ? "spoken" : null;
-    }
+    async read(text, voice) { … }
+    toggle() { … }
+    jumpToWord(index) { … }
+    setHighlight(name) { … }
 }
 ```
 
-`Transcript` takes a strategy and delegates the decision:
+Its whole public surface is four methods:
 
-```js
-class Transcript {
-    constructor(container, onWordClick, strategy = new WordHighlight()) {
-        this.container = container;
-        this.onWordClick = onWordClick;
-        this.strategy = strategy;
-        this.words = [];
-        this.spans = [];
-        this.activeIndex = -1;
-    }
+| Method | What it hides |
+| --- | --- |
+| `read(text, voice)` | fetch → render → load → status updates |
+| `toggle()` | play/pause routed through the current `PlayerState` |
+| `jumpToWord(index)` | word index → start time → `Player.seek()` |
+| `setHighlight(name)` | strategy lookup → `Transcript.setStrategy()` → repaint |
 
-    setStrategy(strategy) {
-        this.strategy = strategy;
-        this.activeIndex = -1; // force a repaint on the next tick
-    }
+`App` (line 292) now reads like a control panel: grab elements, build one
+facade, bind three listeners. It never names `TTSClient`, `Transcript` or
+`Player`.
 
-    highlightAt(time) {
-        const index = this.indexAt(time);
-        if (index === this.activeIndex) return;
-        this.activeIndex = index;
-        this.spans.forEach((span, i) => {
-            const cls = this.strategy.classFor(i, index, this.words);
-            span.classList.toggle("active", cls === "active");
-            span.classList.toggle("spoken", cls === "spoken");
-        });
-        this.spans[index]?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }
-}
-```
+Note what the facade does **not** do: it does not wrap or restrict the
+subsystem. `ReaderFacade.transcript` and `.player` are still reachable for
+anything unusual. That is the difference between a Facade and an Adapter or a
+Proxy — a facade is a convenience, not a barrier.
 
-A `<select>` in the UI can now switch highlight styles mid-playback with
-`transcript.setStrategy(new SentenceHighlight())` — no change to `Transcript`,
-`Player`, or `App` logic.
-
-### 2b. `SynthesisStrategy` — where the audio comes from
-
-`TTSClient` is already one strategy: "ask the Express backend, which uses
-`edge-tts-universal`". A second one is the browser's built-in
-`speechSynthesis`, useful as an offline fallback. Both answer the same call.
-
-```js
-class SynthesisStrategy {
-    /** @returns {Promise<{audio: string|null, words: Array}>} */
-    async synthesize(text, voice) {
-        throw new Error("not implemented");
-    }
-}
-
-class ServerTTS extends SynthesisStrategy {
-    constructor(endpoint = "/api/tts") {
-        super();
-        this.endpoint = endpoint;
-    }
-    async synthesize(text, voice) {
-        const res = await fetch(this.endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text, voice }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "synthesis failed");
-        return data; // { audio: base64 mp3, words: [{text, start, end}] }
-    }
-}
-
-class BrowserTTS extends SynthesisStrategy {
-    // Uses the platform speechSynthesis engine; no server round-trip.
-    async synthesize(text) {
-        return { audio: null, words: this.#estimateWords(text) };
-    }
-    #estimateWords(text) { /* rough timings from word length */ }
-}
-```
-
-`App` keeps a strategy field instead of a hardcoded client:
-
-```js
-this.synthesis = navigator.onLine ? new ServerTTS() : new BrowserTTS();
-const { audio, words } = await this.synthesis.synthesize(text, this.voiceEl.value);
-```
-
-`App` never learns which engine ran. That is the whole point of the pattern.
-
-### UML — class diagram
+### UML
 
 ```mermaid
 classDiagram
-    class Transcript {
-        -HighlightStrategy strategy
-        +render(words)
-        +indexAt(time)
-        +highlightAt(time)
-        +setStrategy(strategy)
-    }
-    class HighlightStrategy {
-        <<interface>>
-        +classFor(index, activeIndex, words)
-    }
-    class WordHighlight
-    class KaraokeHighlight
-    class SentenceHighlight
-
     class App {
-        -SynthesisStrategy synthesis
+        -ReaderFacade reader
+        -HTMLElement textEl
+        -HTMLElement voiceEl
+        -HTMLElement highlightEl
         +generate()
     }
-    class SynthesisStrategy {
-        <<interface>>
+    class ReaderFacade {
+        -TTSClient client
+        -Transcript transcript
+        -Player player
+        +read(text, voice)
+        +toggle()
+        +jumpToWord(index)
+        +setHighlight(name)
+    }
+    class TTSClient {
+        -string endpoint
         +synthesize(text, voice)
     }
-    class ServerTTS
-    class BrowserTTS
+    class Transcript
+    class Player
 
-    Transcript o--> HighlightStrategy
-    HighlightStrategy <|.. WordHighlight
-    HighlightStrategy <|.. KaraokeHighlight
-    HighlightStrategy <|.. SentenceHighlight
+    App *--> ReaderFacade
+    ReaderFacade *--> TTSClient
+    ReaderFacade *--> Transcript
+    ReaderFacade *--> Player
+```
 
-    App o--> SynthesisStrategy
-    SynthesisStrategy <|.. ServerTTS
-    SynthesisStrategy <|.. BrowserTTS
+### Sequence — one "Generate", then a word click
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant App
+    participant Facade as ReaderFacade
+    participant Client as TTSClient
+    participant Server as Express /api/tts
+    participant Tr as Transcript
+    participant Pl as Player
+
+    User->>App: click Generate
+    App->>Facade: read(text, voice)
+    Facade->>Client: synthesize(text, voice)
+    Client->>Server: POST /api/tts
+    Server-->>Client: {audio, words}
+    Client-->>Facade: {audio, words}
+    Facade->>Tr: render(words)
+    Facade->>Pl: load(audio)
+    Pl->>App: onStateChange(PausedState)
+    App-->>User: button enabled, "Play"
+
+    User->>Tr: click a word
+    Tr->>Facade: jumpToWord(index)
+    Facade->>Pl: seek(startTime)
+    Pl->>Pl: state.seek() -> PlayingState
+    loop every animation frame
+        Pl->>Tr: highlightAt(currentTime)
+        Tr->>Tr: strategy.classFor(...) per word
+    end
 ```
 
 ---
 
-## 3. State vs Strategy
+## 4. State vs Strategy
 
-Structurally the two patterns are twins: a context object holds a reference to a
-polymorphic helper and delegates to it. The difference is in *who chooses* and
-*what the helper knows*.
+Structurally the two are twins: a context holds a polymorphic helper and
+delegates to it. The difference is *who picks the helper* and *what the helper
+knows*.
 
 | | State | Strategy |
 | --- | --- | --- |
-| Who selects the object | The states themselves, via transitions | The client / user / configuration |
-| Does it change during one run? | Yes, constantly | Rarely, and only on request |
-| Do the variants know each other? | Yes — a state constructs its successor | No — strategies are independent |
+| Who selects it | The states themselves, plus the audio events | The user, via the highlight `<select>` |
+| Changes during one run? | Constantly | Only when asked |
+| Do variants know each other? | Yes — `PausedState.toggle()` causes `PlayingState` | No — the three highlights ignore each other |
 | Models | A lifecycle | An interchangeable algorithm |
-| Here | `Idle → Paused → Playing → Ended` | Word / karaoke / sentence highlighting; server vs browser TTS |
+| Here | `Idle → Paused → Playing → Ended` | Word / karaoke / sentence highlighting |
 
-A useful test: if removing one variant breaks the transitions of another, it is
-State. If each variant could be deleted without the others noticing, it is
-Strategy.
+Useful test: delete one variant. If another variant's transitions break, it was
+State. If nobody notices, it was Strategy.
 
-## 4. Full picture
+---
+
+## 5. The whole picture
 
 ```mermaid
 classDiagram
     class App
+    class ReaderFacade
+    class TTSClient
     class Transcript
     class Player
-    class SynthesisStrategy {
-        <<interface>>
-    }
     class HighlightStrategy {
         <<interface>>
     }
@@ -410,27 +402,40 @@ classDiagram
         <<abstract>>
     }
 
-    App *--> Transcript
-    App *--> Player
-    App o--> SynthesisStrategy : Strategy
+    App *--> ReaderFacade : Facade
+    ReaderFacade *--> TTSClient
+    ReaderFacade *--> Transcript
+    ReaderFacade *--> Player
     Transcript o--> HighlightStrategy : Strategy
     Player o--> PlayerState : State
 ```
 
-`App` composes the collaborators (composition — they die with it). Each
-collaborator aggregates the pluggable object that varies (aggregation — swappable
-at runtime).
+Composition (filled diamond) for the parts that live and die with their owner;
+aggregation (hollow diamond) for the pluggable objects that are swapped at
+runtime.
 
-## 5. Applying this to the current code
+---
 
-Nothing above is in `public/app.js` yet; the file ships the simple version
-(implicit state, hardcoded highlighting, a single `TTSClient`). Adopt in this
-order, smallest payoff first:
+## 6. What is deliberately *not* a pattern here
 
-1. **State on `Player`** — pays for itself immediately: it removes the duplicated
-   button-label logic and adds a real "ended" behaviour.
-2. **`HighlightStrategy`** — worth it once there is a second highlight mode to
-   offer; before then `WordHighlight` alone is an interface with one
-   implementation.
-3. **`SynthesisStrategy`** — worth it only when a second engine (offline
-   fallback, a different provider) actually exists.
+- **`HIGHLIGHTS` (line 52)** is a plain name → constructor map, not a Factory.
+  It exists so the `<select>` value can name a strategy. A Factory would be
+  warranted only if creating a strategy needed real work.
+- **A `SynthesisStrategy`** (server TTS vs the browser's `speechSynthesis`)
+  would be the textbook second Strategy, and `TTSClient` already has the right
+  shape for it. It is not implemented, because a second engine does not exist
+  yet — an interface with one implementation is cost without benefit. Add it the
+  day an offline fallback is needed.
+- **The `onTick` / `onStateChange` callbacks** are Observer in spirit, but with
+  one listener each a plain function is the honest implementation; a full
+  subject/observer registry would be ceremony.
+
+## 7. Checking the patterns still work
+
+`test.js` covers the pure logic of all three: `Transcript.indexAt()`, each
+highlight strategy's `classFor()`, and each state's `label` / `enabled` /
+`toggle()` / `seek()` behaviour against a fake audio element.
+
+```
+npm test
+```
