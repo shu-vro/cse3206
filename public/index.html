@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Read Aloud</title>
+        <link rel="stylesheet" href="style.css" />
+    </head>
+    <body>
+        <main>
+            <h1>Read Aloud</h1>
+            <p class="sub">Type something, hear it, follow along.</p>
+
+            <textarea id="text" rows="5" placeholder="Paste or type your text here…">The quick brown fox jumps over the lazy dog. Click any word to jump straight to it.</textarea>
+
+            <div class="row">
+                <select id="voice">
+                    <option value="en-US-EmmaMultilingualNeural">Emma (US)</option>
+                    <option value="en-US-AndrewMultilingualNeural">Andrew (US)</option>
+                    <option value="en-GB-SoniaNeural">Sonia (UK)</option>
+                </select>
+                <button id="generate" class="primary">Generate</button>
+                <button id="playPause" disabled>Play</button>
+                <span id="status"></span>
+            </div>
+
+            <div id="transcript" class="transcript"></div>
+        </main>
+
+        <script src="app.js"></script>
+    </body>
+</html>

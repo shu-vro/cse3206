@@ -1,0 +1,26 @@
+{
+  "name": "cse3206",
+  "version": "1.0.0",
+  "description": "welcome freebies",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shu-vro/cse3206.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/shu-vro/cse3206/issues"
+  },
+  "homepage": "https://github.com/shu-vro/cse3206#readme",
+  "dependencies": {
+    "edge-tts-universal": "^1.4.0",
+    "express": "^5.2.1"
+  }
+}
